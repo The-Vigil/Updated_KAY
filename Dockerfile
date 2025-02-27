@@ -1,8 +1,7 @@
 FROM python:3.10-slim
-
 WORKDIR /app
 
-# Install ffmpeg and clean up in one layer to keep image size small
+# Install ffmpeg and clean up in one layer
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     && apt-get clean \
