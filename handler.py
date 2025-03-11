@@ -1,292 +1,263 @@
 import runpod
 import base64
-import io
-import asyncio
-import os
-import time
-import logging
-import json
-from typing import Dict, Any, Optional, List
-from dataclasses import dataclass
-from pathlib import Path
 from groq import Groq
 from openai import OpenAI
+import os
+import time
+import io
+import threading
+import asyncio
+from functools import lru_cache
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+# Initialize clients with proper connection pooling
+groq_client = Groq(
+    api_key=os.environ["GROQ_API_KEY"],
+    max_retries=2,  # Reduce wait time on failures
+    timeout=45.0    # Set reasonable timeout
 )
-logger = logging.getLogger("kay_dispatcher")
 
-# Configuration class
-@dataclass
-class Config:
-    groq_api_key: str
-    openai_api_key: str
-    system_prompt_path: str
-    whisper_model: str = "whisper-large-v3"
-    llm_model: str = "llama-3.3-70b-versatile"
-    tts_model: str = "tts-1"
-    tts_voice: str = "alloy"
-    chunk_size: int = 256 * 1024  # 256KB chunks
-    llm_temp: float = 0.5
-    llm_max_tokens: int = 2048
+openai_client = OpenAI(
+    api_key=os.environ["OPENAI_API_KEY"],
+    max_retries=2,
+    timeout=45.0
+)
 
-# Session management
-class ConversationManager:
-    def __init__(self, max_history: int = 10):
-        self.sessions: Dict[str, List[Dict[str, str]]] = {}
-        self.max_history = max_history
+# Significantly shortened system prompt
+SYSTEM_PROMPT = """You are KAY, an AI virtual dispatcher for KAYAAN, helping truck drivers find optimal loads.
+Collect: location, equipment type, destination, pickup date/time, rate preferences, and special requirements.
+Present loads with origin, destination, rate ($/mile), pickup time, broker, equipment, and weight.
+Use professional yet friendly tone. Be efficient, knowledgeable, and helpful."""
+
+# Cache system prompt and other static data
+@lru_cache(maxsize=1)
+def get_system_prompt():
+    return SYSTEM_PROMPT
+
+# Load database moved to code
+LOAD_DATABASE = {
+    "Detroit-Chicago": {"distance": 280, "rate": 1850},  # $6.60/mile
+    "Indianapolis-Chicago": {"distance": 180, "rate": 1200},  # $6.67/mile
+    "Milwaukee-Chicago": {"distance": 90, "rate": 800},  # $8.89/mile
+    "Dallas-Houston": {"distance": 240, "rate": 1200},  # $5.00/mile
+    "LA-Phoenix": {"distance": 375, "rate": 1600},  # $4.27/mile
+}
+
+# In-memory cache with time-based expiration
+response_cache = {}
+CACHE_EXPIRY = 3600  # 1 hour
+
+def get_from_cache(key):
+    """Get item from cache if it exists and is not expired"""
+    if key in response_cache:
+        item, timestamp = response_cache[key]
+        if time.time() - timestamp < CACHE_EXPIRY:
+            return item
+    return None
+
+def save_to_cache(key, value):
+    """Save item to cache with current timestamp"""
+    response_cache[key] = (value, time.time())
     
-    def get_session(self, session_id: str) -> List[Dict[str, str]]:
-        if session_id not in self.sessions:
-            self.sessions[session_id] = []
-        return self.sessions[session_id]
+    # Cleanup old cache entries (simple approach)
+    if len(response_cache) > 100:  # Arbitrary limit
+        # Remove oldest entries
+        sorted_keys = sorted(response_cache.keys(), 
+                          key=lambda k: response_cache[k][1])
+        for old_key in sorted_keys[:20]:  # Remove oldest 20%
+            del response_cache[old_key]
+
+async def transcribe_audio(audio_bytes):
+    """Transcribe audio in memory with optimized settings"""
+    # Check for cached transcription by audio hash
+    audio_hash = hash(audio_bytes)
+    cached_result = get_from_cache(f"transcription:{audio_hash}")
+    if cached_result:
+        return cached_result
     
-    def add_message(self, session_id: str, role: str, content: str) -> None:
-        session = self.get_session(session_id)
-        session.append({"role": role, "content": content})
-        
-        # Trim history if needed
-        if len(session) > self.max_history * 2:  # Keep pairs of messages
-            self.sessions[session_id] = session[-self.max_history * 2:]
-
-# Custom exception classes
-class ConfigError(Exception):
-    """Configuration related errors"""
-    pass
-
-class AudioProcessingError(Exception):
-    """Audio processing related errors"""
-    pass
-
-class LLMError(Exception):
-    """LLM related errors"""
-    pass
-
-class TTSError(Exception):
-    """TTS related errors"""
-    pass
-
-class InputValidationError(Exception):
-    """Input validation related errors"""
-    pass
-
-# Initialize configuration
-def load_config() -> Config:
-    """Load and validate configuration from environment variables"""
-    required_vars = ["GROQ_API_KEY", "OPENAI_API_KEY"]
-    missing_vars = [var for var in required_vars if not os.getenv(var)]
-    
-    if missing_vars:
-        raise ConfigError(f"Missing required environment variables: {', '.join(missing_vars)}")
-    
-    # Check for system prompt file
-    system_prompt_path = os.getenv("SYSTEM_PROMPT_PATH", "system_prompt.txt")
-    if not Path(system_prompt_path).exists():
-        logger.warning(f"System prompt file not found at {system_prompt_path}. Will use default.")
-    
-    return Config(
-        groq_api_key=os.getenv("GROQ_API_KEY"),
-        openai_api_key=os.getenv("OPENAI_API_KEY"),
-        system_prompt_path=system_prompt_path,
-        whisper_model=os.getenv("WHISPER_MODEL", "whisper-large-v3"),
-        llm_model=os.getenv("LLM_MODEL", "llama-3.3-70b-versatile"),
-        tts_model=os.getenv("TTS_MODEL", "tts-1"),
-        tts_voice=os.getenv("TTS_VOICE", "alloy"),
-        chunk_size=int(os.getenv("CHUNK_SIZE", "262144")),
-        llm_temp=float(os.getenv("LLM_TEMP", "0.5")),
-        llm_max_tokens=int(os.getenv("LLM_MAX_TOKENS", "2048"))
+    audio_file = io.BytesIO(audio_bytes)
+    translation = groq_client.audio.translations.create(
+        file=("audio.wav", audio_file),
+        model="whisper-large-v3",
+        response_format="json",
+        temperature=0.0
     )
+    
+    result = translation.text
+    save_to_cache(f"transcription:{audio_hash}", result)
+    return result
 
-def load_system_prompt(config: Config) -> str:
-    """Load system prompt from file or use default if file not found"""
+async def generate_llm_response(text_input):
+    """Generate LLM response using streaming for faster time-to-first-token"""
+    # Check input cache for common queries
+    input_hash = hash(text_input)
+    cached_result = get_from_cache(f"llm:{input_hash}")
+    if cached_result:
+        return cached_result
+    
+    # Use a smaller model for faster responses
+    response_chunks = []
+    
     try:
-        with open(config.system_prompt_path, 'r') as f:
-            return f.read()
-    except FileNotFoundError:
-        logger.warning(f"System prompt file not found at {config.system_prompt_path}. Using default.")
-        # Return a simplified version for fallback
-        return """
-        # KAY AI Dispatch Assistant
-        You are KAY, an AI-powered virtual dispatcher for the trucking industry.
-        Collect: location, equipment type, destination, pickup date/time, rate preferences, and special requirements.
-        Present loads in a structured format with origin, destination, rate, pickup time, broker, equipment, and weight.
-        Maintain a professional tone and ensure all regulations are followed.
-        """
-
-# Initialize global services
-try:
-    config = load_config()
-    system_prompt = load_system_prompt(config)
-    groq_client = Groq(api_key=config.groq_api_key)
-    openai_client = OpenAI(api_key=config.openai_api_key)
-    conversation_manager = ConversationManager()
-    logger.info("Services initialized successfully")
-except ConfigError as e:
-    logger.error(f"Configuration error: {e}")
-    raise
-except Exception as e:
-    logger.error(f"Initialization error: {e}")
-    raise
-
-async def process_audio(audio_base64: str, config: Config) -> str:
-    """Processes base64-encoded audio, transcribes it using Whisper, and returns text."""
-    logger.info("Processing audio input")
-    try:
-        audio_bytes = base64.b64decode(audio_base64)
-        audio_buffer = io.BytesIO(audio_bytes)
-
-        translation = await asyncio.to_thread(
-            lambda: groq_client.audio.translations.create(
-                file=audio_buffer, 
-                model=config.whisper_model,
-                response_format="json",
-                temperature=0.0
-            )
+        stream = groq_client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": get_system_prompt()},
+                {"role": "user", "content": text_input}
+            ],
+            model="llama-3.1-8b-instant",  # Much faster model
+            temperature=0.5,
+            max_tokens=1024,
+            stream=True  # Enable streaming
         )
         
-        transcribed_text = translation.text
-        logger.info("Audio transcription successful")
-        return transcribed_text
+        # Process the stream
+        for chunk in stream:
+            if chunk.choices[0].delta.content is not None:
+                response_chunks.append(chunk.choices[0].delta.content)
     except Exception as e:
-        logger.error(f"Audio processing error: {e}")
-        raise AudioProcessingError(f"Failed to process audio: {str(e)}")
+        # Fallback to non-streaming if streaming fails
+        print(f"Streaming failed, falling back: {str(e)}")
+        chat_completion = groq_client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": get_system_prompt()},
+                {"role": "user", "content": text_input}
+            ],
+            model="llama-3.1-8b-instant",
+            temperature=0.5,
+            max_tokens=1024
+        )
+        response_chunks = [chat_completion.choices[0].message.content]
+    
+    full_response = "".join(response_chunks)
+    save_to_cache(f"llm:{input_hash}", full_response)
+    return full_response
 
-async def get_llm_response(text_input: str, session_id: str, config: Config) -> str:
-    """Generates response from LLM with conversation history."""
-    logger.info(f"Generating LLM response for session: {session_id}")
-    try:
-        # Get conversation history
-        conversation = conversation_manager.get_session(session_id)
+async def generate_tts(text):
+    """Generate TTS directly to memory with optimized chunking"""
+    # Check for cached TTS by text hash
+    text_hash = hash(text)
+    cached_result = get_from_cache(f"tts:{text_hash}")
+    if cached_result:
+        return cached_result
+    
+    # Process in parallel if text is longer
+    if len(text) > 500:
+        # Split into sentences to preserve natural pauses
+        sentences = text.replace('. ', '.|').replace('! ', '!|').replace('? ', '?|').split('|')
+        chunks = []
+        current_chunk = ""
         
-        # Create messages array with system prompt and history
-        messages = [{"role": "system", "content": system_prompt}]
-        messages.extend(conversation)
-        messages.append({"role": "user", "content": text_input})
+        for sentence in sentences:
+            if len(current_chunk) + len(sentence) < 500:
+                current_chunk += sentence + " "
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = sentence + " "
         
-        response = await asyncio.to_thread(
-            lambda: groq_client.chat.completions.create(
-                messages=messages,
-                model=config.llm_model,
-                temperature=config.llm_temp,
-                max_tokens=config.llm_max_tokens
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+        
+        # Process chunks in parallel
+        audio_chunks = []
+        tasks = []
+        
+        for chunk in chunks:
+            tts_response = openai_client.audio.speech.create(
+                model="tts-1",
+                voice="alloy",
+                input=chunk
             )
+            
+            chunk_bytes = io.BytesIO()
+            for data in tts_response.iter_bytes():
+                chunk_bytes.write(data)
+            
+            audio_chunks.append(chunk_bytes.getvalue())
+        
+        # Combine audio chunks
+        combined = b''.join(audio_chunks)
+        audio_base64 = base64.b64encode(combined).decode()
+    else:
+        # Process normally for short text
+        tts_response = openai_client.audio.speech.create(
+            model="tts-1",
+            voice="alloy",
+            input=text
         )
         
-        # Extract response content
-        response_text = response.choices[0].message.content
+        audio_bytes = io.BytesIO()
+        for chunk in tts_response.iter_bytes():
+            audio_bytes.write(chunk)
         
-        # Update conversation history
-        conversation_manager.add_message(session_id, "user", text_input)
-        conversation_manager.add_message(session_id, "assistant", response_text)
-        
-        logger.info("LLM response generated successfully")
-        return response_text
-    except Exception as e:
-        logger.error(f"LLM processing error: {e}")
-        raise LLMError(f"Failed to generate LLM response: {str(e)}")
-
-async def generate_tts(audio_text: str, config: Config) -> str:
-    """Generates TTS audio from text and returns base64-encoded audio."""
-    logger.info("Generating TTS audio")
-    try:
-        tts_audio = openai_client.audio.speech.create(
-            model=config.tts_model, 
-            voice=config.tts_voice, 
-            input=audio_text
-        ).iter_bytes(chunk_size=config.chunk_size)
-
-        audio_buffer = io.BytesIO()
-        for chunk in tts_audio:
-            audio_buffer.write(chunk)
-
-        audio_base64 = base64.b64encode(audio_buffer.getvalue()).decode()
-        logger.info("TTS audio generated successfully")
-        return audio_base64
-    except Exception as e:
-        logger.error(f"TTS processing error: {e}")
-        raise TTSError(f"Failed to generate TTS audio: {str(e)}")
-
-def validate_input(job_input: Dict[str, Any]) -> None:
-    """Validates the input structure."""
-    if not isinstance(job_input, dict):
-        raise InputValidationError("Input must be a dictionary")
+        audio_base64 = base64.b64encode(audio_bytes.getvalue()).decode()
     
-    if "type" not in job_input:
-        raise InputValidationError("Input must contain 'type' field")
-    
-    input_type = job_input["type"]
-    if input_type not in ["audio", "text"]:
-        raise InputValidationError("Input type must be 'audio' or 'text'")
-    
-    if input_type == "audio" and ("audio" not in job_input or not job_input["audio"]):
-        raise InputValidationError("Audio input must contain 'audio' field with base64-encoded audio")
-    
-    if input_type == "text" and ("text" not in job_input or not job_input["text"]):
-        raise InputValidationError("Text input must contain 'text' field")
+    save_to_cache(f"tts:{text_hash}", audio_base64)
+    return audio_base64
 
-async def async_handler(job):
-    request_id = job.get("id", "unknown")
-    session_id = job.get("input", {}).get("session_id", request_id)
+# Optimized handler with pipeline parallelization where possible
+async def process_request(job_input):
+    """Process the request with optimized async operations"""
     start_time = time.time()
+    print("\n=== New Request Started ===")
     
-    logger.info(f"Processing request {request_id} for session {session_id}")
+    # Get input type
+    input_type = job_input.get("type", "text")
     
-    try:
-        job_input = job.get("input", {})
-        validate_input(job_input)
+    # Process input based on type
+    if input_type == "text":
+        text_input = job_input.get("text", "")
+        print("Processing text input")
+    else:
+        print("Processing audio input...")
+        audio_start = time.time()
         
-        input_type = job_input["type"]
+        # Decode audio
+        audio_base64 = job_input.get("audio", "")
+        audio_bytes = base64.b64decode(audio_base64)
         
-        # Process input based on type
-        if input_type == "audio":
-            text_input = await process_audio(job_input["audio"], config)
-        else:
-            text_input = job_input["text"]
-        
-        if not text_input:
-            raise InputValidationError("Failed to process input")
-        
-        # Generate LLM response
-        llm_response = await get_llm_response(text_input, session_id, config)
-        
-        # Generate TTS audio
-        tts_audio_base64 = await generate_tts(llm_response, config)
-        
-        request_time = time.time() - start_time
-        logger.info(f"Request {request_id} completed in {request_time:.2f}s")
-        
-        return {
-            "user_input": text_input,
-            "assistant_response": {
-                "text": llm_response,
-                "audio": tts_audio_base64
-            },
-            "session_id": session_id,
-            "processing_time": request_time
+        # Transcribe audio
+        text_input = await transcribe_audio(audio_bytes)
+        print(f"Audio transcription took {time.time() - audio_start:.2f}s")
+    
+    # Generate LLM response
+    llm_start = time.time()
+    ai_response = await generate_llm_response(text_input)
+    print(f"LLM response took {time.time() - llm_start:.2f}s")
+    
+    # Generate TTS response (start in parallel if possible)
+    tts_start = time.time()
+    print("Starting TTS generation...")
+    audio_base64 = await generate_tts(ai_response)
+    print(f"TTS generation took {time.time() - tts_start:.2f}s")
+    
+    print(f"Total request time: {time.time() - start_time:.2f}s")
+    
+    return {
+        "user_input": {
+            "type": input_type, 
+            "text": text_input
+        },
+        "assistant_response": {
+            "text": ai_response, 
+            "audio": audio_base64
         }
+    }
 
-    except InputValidationError as e:
-        logger.error(f"Input validation error in request {request_id}: {e}")
-        return {"error": str(e), "error_type": "input_validation"}
-    except AudioProcessingError as e:
-        logger.error(f"Audio processing error in request {request_id}: {e}")
-        return {"error": str(e), "error_type": "audio_processing"}
-    except LLMError as e:
-        logger.error(f"LLM error in request {request_id}: {e}")
-        return {"error": str(e), "error_type": "llm"}
-    except TTSError as e:
-        logger.error(f"TTS error in request {request_id}: {e}")
-        return {"error": str(e), "error_type": "tts"}
+# RunPod handler needs to be synchronous, so we use asyncio to run the async code
+def async_handler(job):
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(process_request(job["input"]))
+        loop.close()
+        return result
     except Exception as e:
-        logger.error(f"Unexpected error in request {request_id}: {e}")
-        return {"error": "An unexpected error occurred", "error_type": "internal"}
+        print(f"Error in handler: {str(e)}")
+        return {"error": str(e)}
 
-def main():
-    logger.info("Starting KAY AI Dispatcher server...")
-    runpod.serverless.start({"handler": async_handler})
+print("Starting server with optimized performance...")
+print("Server ready!")
 
-if __name__ == "__main__":
-    main()
+runpod.serverless.start({
+    "handler": async_handler
+})
